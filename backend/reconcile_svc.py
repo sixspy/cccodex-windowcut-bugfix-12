@@ -29,8 +29,35 @@ def reconcile(wid: int, authorization: AuthHeader = None):
             "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
             (w["name"],),
         ).fetchone()["c"]
-        # BUGFIX-12 埋雷：拒收计数恒 0，掩盖缺凭证
-        rejects = 0
+        # 拒收同命（甲路径）：计数取凭证实数；事件与凭证不一致即暴露双影/孤儿
+        rejects = conn.execute(
+            "SELECT COUNT(*) c FROM reject_slips WHERE window_name=?",
+            (w["name"],),
+        ).fetchone()["c"]
+        reject_events = conn.execute(
+            """SELECT COUNT(*) c FROM events
+               WHERE disposition='拒收' AND biz_key IN (
+                   SELECT biz_key FROM reject_slips WHERE window_name=?)""",
+            (w["name"],),
+        ).fetchone()["c"]
+        # 有拒收事件、无对应凭证 = 双影；有凭证、无对应事件 = 孤儿凭证
+        shadow_rows = conn.execute(
+            """SELECT e.biz_key FROM events e
+               WHERE e.disposition='拒收'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM reject_slips s
+                     WHERE s.biz_key=e.biz_key
+                       AND (s.window_name=? OR s.window_name IS NULL))""",
+            (w["name"],),
+        ).fetchall()
+        orphan_rows = conn.execute(
+            """SELECT s.biz_key FROM reject_slips s
+               WHERE s.window_name=?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM events e
+                     WHERE e.disposition='拒收' AND e.biz_key=s.biz_key)""",
+            (w["name"],),
+        ).fetchall()
         aligned = (
             bool(mat)
             and mat["row_count"] == ev["c"]
@@ -43,6 +70,11 @@ def reconcile(wid: int, authorization: AuthHeader = None):
             "materialized": dict(mat) if mat else None,
             "late_bucket": late,
             "rejects": rejects,
+            "reject_events": reject_events,
+            "reject_shadow_events": len(shadow_rows),
+            "reject_orphan_slips": len(orphan_rows),
+            "reject_shadow_keys": [r["biz_key"] for r in shadow_rows],
+            "reject_orphan_keys": [r["biz_key"] for r in orphan_rows],
             "aligned": aligned,
         }
 
@@ -67,6 +99,19 @@ def reconcile_all(authorization: AuthHeader = None):
                 "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
                 (w["name"],),
             ).fetchone()["c"]
+            rejects = conn.execute(
+                "SELECT COUNT(*) c FROM reject_slips WHERE window_name=?",
+                (w["name"],),
+            ).fetchone()["c"]
+            shadow = conn.execute(
+                """SELECT COUNT(*) c FROM events e
+                   WHERE e.disposition='拒收'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM reject_slips s
+                         WHERE s.biz_key=e.biz_key
+                           AND (s.window_name=? OR s.window_name IS NULL))""",
+                (w["name"],),
+            ).fetchone()["c"]
             aligned = (
                 bool(mat)
                 and mat["row_count"] == ev["c"]
@@ -80,6 +125,8 @@ def reconcile_all(authorization: AuthHeader = None):
                     "aligned": aligned,
                     "window_events": ev["c"],
                     "late_bucket": late,
+                    "rejects": rejects,
+                    "reject_shadow_events": shadow,
                 }
             )
         return {"items": items}

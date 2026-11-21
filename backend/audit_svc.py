@@ -31,6 +31,49 @@ def audit_actions(authorization: AuthHeader = None):
         return {"items": [dict(r) for r in rows]}
 
 
+@router.get("/api/audit/reject-fate")
+def reject_fate(authorization: AuthHeader = None):
+    """拒收同命旁路：events 拒收行与 reject_slips 凭证同源核对。
+
+    - shadow_events：有拒收事件、无凭证（双影/单边）
+    - orphan_slips：有凭证、无拒收事件（孤儿凭证）
+    """
+    require_user(authorization)
+    with connect() as conn:
+        reject_events = conn.execute(
+            "SELECT COUNT(*) c FROM events WHERE disposition='拒收'"
+        ).fetchone()["c"]
+        reject_slips = conn.execute(
+            "SELECT COUNT(*) c FROM reject_slips"
+        ).fetchone()["c"]
+        shadows = conn.execute(
+            """SELECT e.biz_key, e.event_ts, e.amount, e.created_at
+               FROM events e
+               WHERE e.disposition='拒收'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM reject_slips s WHERE s.biz_key=e.biz_key)"""
+        ).fetchall()
+        orphans = conn.execute(
+            """SELECT s.biz_key, s.window_name, s.event_ts, s.amount, s.created_at
+               FROM reject_slips s
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM events e
+                   WHERE e.disposition='拒收' AND e.biz_key=s.biz_key)"""
+        ).fetchall()
+        contentions = conn.execute(
+            "SELECT COUNT(*) c FROM contention_log WHERE lock_key LIKE 'ingest:%'"
+        ).fetchone()["c"]
+        return {
+            "reject_events": reject_events,
+            "reject_slips": reject_slips,
+            "shadow_events": len(shadows),
+            "orphan_slips": len(orphans),
+            "shadow_detail": [dict(r) for r in shadows],
+            "orphan_detail": [dict(r) for r in orphans],
+            "ingest_contentions": contentions,
+        }
+
+
 @router.get("/api/dashboard")
 def dashboard(authorization: AuthHeader = None):
     require_user(authorization)
